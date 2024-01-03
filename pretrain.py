@@ -1,22 +1,17 @@
 import argparse
 from argparse import ArgumentParser
-import glob
 import os
-import json
 import time
 import logging
 import random
 import re
-from itertools import chain
-from string import punctuation
 import math
 
 import pandas as pd
 import numpy as np
 import torch
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
-from nlp import load_metric
+from torch.utils.data import Dataset, DataLoader, random_split
 import string
 from pathlib import Path
 from transformers import (
@@ -28,10 +23,6 @@ from transformers import (
     get_linear_schedule_with_warmup
 )
 from torch.utils.data import RandomSampler
-
-import textwrap
-from tqdm.auto import tqdm
-from nlp import load_dataset
 
 def set_seed(seed):
     random.seed(seed)
@@ -89,11 +80,15 @@ def calculate_scores(predictions, ground_truths):
 class T5FineTuner(pl.LightningModule):
     def __init__(self, hparams):
         super(T5FineTuner, self).__init__()
-        self.hparams = hparams
+        # self.hparams = hparams
+        self.save_hyperparameters(hparams)
 #         self.config = T5Config(hparams.model_name_or_path,dropout_rate=0.2)
         self.model = T5ForConditionalGeneration.from_pretrained(hparams.model_name_or_path)
 #         self.model.dropout_rate=0.2
         self.tokenizer = T5Tokenizer.from_pretrained(hparams.tokenizer_name_or_path)
+
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
         
         if self.hparams.freeze_embeds:
             self.freeze_embeds()
@@ -136,7 +131,8 @@ class T5FineTuner(pl.LightningModule):
     
 
     def is_logger(self):
-        return self.trainer.proc_rank <= 0
+        # return self.trainer.global_rank <= 0
+        return True
     
         
     def forward(self, input_ids, attention_mask=None, decoder_input_ids=None, decoder_attention_mask=None, lm_labels=None):
@@ -174,7 +170,7 @@ class T5FineTuner(pl.LightningModule):
     def _generative_step(self, batch) :
         
         t0 = time.time()
-        
+
         generated_ids = self.model.generate(
             batch["source_ids"],
             attention_mask=batch["source_mask"],
@@ -203,30 +199,33 @@ class T5FineTuner(pl.LightningModule):
         
         base_metrics.update(em_score=em_score, subset_match_score=subset_match_score)
         
-#         rouge_results = self.rouge_metric.compute() 
-#         rouge_dict = self.parse_score(rouge_results)    
         return base_metrics
     
 
     def training_step(self, batch, batch_idx):
         loss = self._step(batch)
 
-        tensorboard_logs = {"train_loss": loss}
-        return {"loss": loss, "log": tensorboard_logs}
+        self.training_step_outputs.append(loss)
+        return loss
   
-    def training_epoch_end(self, outputs):
-        avg_train_loss = torch.stack([x["loss"] for x in outputs]).mean()
-        tensorboard_logs = {"avg_train_loss": avg_train_loss}
-        return {"avg_train_loss": avg_train_loss, "log": tensorboard_logs, 'progress_bar': tensorboard_logs}
+    def on_train_epoch_end(self):
+        avg_train_loss = torch.stack(self.training_step_outputs).mean()
+        self.training_step_outputs.clear()
+        self.log("training avg loss", avg_train_loss)
+        return avg_train_loss
 
     def validation_step(self, batch, batch_idx):
-        return self._generative_step(batch)
+        loss = self._generative_step(batch)
+        self.log("my_metric", loss["val_loss"])
+        self.validation_step_outputs.append(loss["val_loss"])
+        return loss
     
   
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        tensorboard_logs = {"val_loss": avg_loss}
+        avg_loss = torch.stack(self.validation_step_outputs).mean()
+        logs = {"val_loss": avg_loss}
+        self.validation_step_outputs.clear()  # free memory
         
         if len(self.em_score_list) <= 2:
             average_em_score = sum(self.em_score_list) / len(self.em_score_list) 
@@ -237,20 +236,18 @@ class T5FineTuner(pl.LightningModule):
             latest_subset_score = self.subset_score_list[:-2]
             average_em_score = sum(latest_em_score) / len(latest_em_score) 
             average_subset_match_score = sum(latest_subset_score)/len(latest_subset_score)
-            
-        
         
         average_em_score = torch.tensor(average_em_score,dtype=torch.float32)
         average_subset_match_score = torch.tensor(average_subset_match_score,dtype=torch.float32)
-        tensorboard_logs.update(em_score=average_em_score, subset_match_score=average_subset_match_score)
+        logs.update(em_score=average_em_score, subset_match_score=average_subset_match_score)
+
+        for l in logs:
+            self.log(l, logs[l])
         
         ## Clear out the lists for next epoch
         self.target_gen= []
         self.prediction_gen=[]
-        return {"avg_val_loss": avg_loss, 
-                "em_score" : average_em_score,
-                "subset_match_score" : average_subset_match_score,
-                "log": tensorboard_logs, 'progress_bar': tensorboard_logs}
+        return avg_loss
 
     def configure_optimizers(self):
         "Prepare optimizer and schedule (linear warmup and decay)"
@@ -274,25 +271,18 @@ class T5FineTuner(pl.LightningModule):
         self.opt = optimizer
         return [optimizer]
   
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, second_order_closure=None, using_native_amp=False):
-        if self.trainer.use_tpu:
-            xm.optimizer_step(optimizer)
-        else:
-            optimizer.step()
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, second_order_closure=None, using_native_amp=False):
+        optimizer.step(optimizer_closure)
         optimizer.zero_grad()
         self.lr_scheduler.step()
   
-    def get_tqdm_dict(self):
-        tqdm_dict = {"loss": "{:.3f}".format(self.trainer.avg_loss), "lr": self.lr_scheduler.get_last_lr()[-1]}
-
-        return tqdm_dict
-    
-
     def train_dataloader(self):   
         n_samples = self.n_obs['train']
         train_dataset = get_dataset(tokenizer=self.tokenizer, type_path="train", num_samples=n_samples, args=self.hparams)
+        generator1 = torch.Generator().manual_seed(42)
+        train_dataset = random_split(train_dataset, [0.1, 0.9],generator1)[0]
         sampler=RandomSampler(train_dataset)
-        dataloader = DataLoader(train_dataset, sampler=sampler,  batch_size=self.hparams.train_batch_size, drop_last=True, num_workers=0)
+        dataloader = DataLoader(train_dataset, sampler=sampler,  batch_size=self.hparams.train_batch_size, drop_last=True, num_workers=4)
         t_total = (
             (len(dataloader.dataset) // (self.hparams.train_batch_size * max(1, self.hparams.n_gpu)))
             // self.hparams.gradient_accumulation_steps
@@ -309,8 +299,10 @@ class T5FineTuner(pl.LightningModule):
         n_samples = self.n_obs['validation']
         
         validation_dataset = get_dataset(tokenizer=self.tokenizer, type_path="validation", num_samples=n_samples, args=self.hparams)
+        generator1 = torch.Generator().manual_seed(42)
+        validation_dataset = random_split(validation_dataset, [0.05, 0.95],generator1)[0]
         sampler=RandomSampler(validation_dataset)
-        return DataLoader(validation_dataset, batch_size=self.hparams.eval_batch_size, sampler =sampler, num_workers=0)
+        return DataLoader(validation_dataset, batch_size=self.hparams.eval_batch_size, num_workers=4)
     
     
     def test_dataloader(self):
@@ -326,20 +318,21 @@ class T5FineTuner(pl.LightningModule):
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
+logger = logging.getLogger("lightning.pytorch")
 
 class LoggingCallback(pl.Callback):
     def on_validation_end(self, trainer, pl_module):
-        logger.info("***** Validation results *****")
+        print("***** Validation results *****")
         if pl_module.is_logger():
             metrics = trainer.callback_metrics
             # Log results
             for key in sorted(metrics):
                 if key not in ["log", "progress_bar"]:
-                    logger.info("{} = {}\n".format(key, str(metrics[key])))
+                    print("{} = {}\n".format(key, str(metrics[key])))
 
     def on_test_end(self, trainer, pl_module):
-        logger.info("***** Test results *****")
+        print("***** Test results *****")
         if pl_module.is_logger():
             metrics = trainer.callback_metrics
             # Log and save results to file
@@ -347,7 +340,7 @@ class LoggingCallback(pl.Callback):
             with open(output_test_results_file, "w") as writer:
                 for key in sorted(metrics):
                     if key not in ["log", "progress_bar"]:
-                        logger.info("{} = {}\n".format(key, str(metrics[key])))
+                        print("{} = {}\n".format(key, str(metrics[key])))
                         writer.write("{} = {}\n".format(key, str(metrics[key])))
 
 prefix_path='' #Path to custom training data. Name the training corpus train_context.csv
@@ -380,7 +373,7 @@ class Pretrain(Dataset):
                     new_rows.append(segment1_)
                 new_rows.append(segment2)
         ds2 = pd.DataFrame(new_rows, columns=['context'])
-        ds = ds.append(ds2)
+        ds = pd.concat([ds, ds2])
         return ds
 
     def __len__(self):
@@ -541,18 +534,15 @@ if __name__ == '__main__':
     args = argparse.Namespace(**args_dict)
 
     ## Define Checkpoint function
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        filepath=args.output_dir, prefix="checkpoint")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=args.output_dir)
 
     ## If resuming from checkpoint, add an arg resume_from_checkpoint
     train_params = dict(
         accumulate_grad_batches=args.gradient_accumulation_steps,
-        gpus=args.n_gpu,
         max_epochs=args.num_train_epochs,
         precision= 16 if args.fp_16 else 32,
-        amp_level=args.opt_level,
         gradient_clip_val=args.max_grad_norm,
-        checkpoint_callback=checkpoint_callback,
+        enable_checkpointing =True,
         val_check_interval=args.val_check_interval,
         callbacks=[LoggingCallback()]
     )
