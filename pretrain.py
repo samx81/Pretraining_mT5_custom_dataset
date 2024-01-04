@@ -1,5 +1,4 @@
 import argparse
-from argparse import ArgumentParser
 import os
 import time
 import logging
@@ -7,25 +6,26 @@ import random
 import re
 import math
 import unicodedata
+import string
 
 import pandas as pd
 import numpy as np
 import torch
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader, random_split
-import string
+from torch.utils.data import Dataset, DataLoader, RandomSampler
 from pathlib import Path
-from taibun import Tokeniser
-import pangu
 from transformers import (
     AdamW,
     Adafactor,
     T5ForConditionalGeneration,
+    MT5ForConditionalGeneration,
+    MT5Tokenizer,
     T5Tokenizer,
     T5Config,
     get_linear_schedule_with_warmup
 )
-from torch.utils.data import RandomSampler
+from taibun import Tokeniser
+import pangu
 
 def set_seed(seed):
     random.seed(seed)
@@ -99,9 +99,9 @@ class T5FineTuner(pl.LightningModule):
         # self.hparams = hparams
         self.save_hyperparameters(hparams)
 #         self.config = T5Config(hparams.model_name_or_path,dropout_rate=0.2)
-        self.model = T5ForConditionalGeneration.from_pretrained(hparams.model_name_or_path)
+        self.model = MT5ForConditionalGeneration.from_pretrained(hparams.model_name_or_path)
 #         self.model.dropout_rate=0.2
-        self.tokenizer = T5Tokenizer.from_pretrained(hparams.tokenizer_name_or_path)
+        self.tokenizer = MT5Tokenizer.from_pretrained(hparams.tokenizer_name_or_path)
         self.model.resize_token_embeddings(len(self.tokenizer))
 
         self.training_step_outputs = []
@@ -520,7 +520,7 @@ def get_dataset(tokenizer, type_path, num_samples, args):
     )
 
 if __name__ == '__main__':
-    parser = ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument('--input_length', default=128)
     parser.add_argument('--output_length', default=128)
     parser.add_argument('--num_train_epochs', default=1)
