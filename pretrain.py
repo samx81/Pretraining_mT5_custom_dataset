@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import math
+import unicodedata
 
 import pandas as pd
 import numpy as np
@@ -14,6 +15,8 @@ import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader, random_split
 import string
 from pathlib import Path
+from taibun import Tokeniser
+import pangu
 from transformers import (
     AdamW,
     Adafactor,
@@ -77,6 +80,19 @@ def calculate_scores(predictions, ground_truths):
     subset_match_score /= len(predictions)
     return em_score*100, subset_match_score*100
 
+def is_cjk(input):
+    return all(
+        ord(char) == 0xFF0C or # CJK comma
+        0x3000 <= ord(char) <= 0x303F or  # CJK Punc
+        0x4E00 <= ord(char) <= 0x9FFF or  # BASIC
+        0x3400 <= ord(char) <= 0x4DBF or  # Ext A
+        0x20000 <= ord(char) <= 0x2A6DF or  # Ext B
+        0x2A700 <= ord(char) <= 0x2EBEF or  # Ext C,D,E,F
+        0x30000 <= ord(char) <= 0x323AF or  # Ext G,H
+        0x2EBF0 <= ord(char) <= 0x2EE5F  # Ext I
+        for char in input
+    )
+
 class T5FineTuner(pl.LightningModule):
     def __init__(self, hparams):
         super(T5FineTuner, self).__init__()
@@ -86,6 +102,7 @@ class T5FineTuner(pl.LightningModule):
         self.model = T5ForConditionalGeneration.from_pretrained(hparams.model_name_or_path)
 #         self.model.dropout_rate=0.2
         self.tokenizer = T5Tokenizer.from_pretrained(hparams.tokenizer_name_or_path)
+        self.model.resize_token_embeddings(len(self.tokenizer))
 
         self.training_step_outputs = []
         self.validation_step_outputs = []
@@ -279,10 +296,8 @@ class T5FineTuner(pl.LightningModule):
     def train_dataloader(self):   
         n_samples = self.n_obs['train']
         train_dataset = get_dataset(tokenizer=self.tokenizer, type_path="train", num_samples=n_samples, args=self.hparams)
-        generator1 = torch.Generator().manual_seed(42)
-        train_dataset = random_split(train_dataset, [0.1, 0.9],generator1)[0]
         sampler=RandomSampler(train_dataset)
-        dataloader = DataLoader(train_dataset, sampler=sampler,  batch_size=self.hparams.train_batch_size, drop_last=True, num_workers=4)
+        dataloader = DataLoader(train_dataset, sampler=sampler, batch_size=self.hparams.train_batch_size, drop_last=True, num_workers=4)
         t_total = (
             (len(dataloader.dataset) // (self.hparams.train_batch_size * max(1, self.hparams.n_gpu)))
             // self.hparams.gradient_accumulation_steps
@@ -299,15 +314,11 @@ class T5FineTuner(pl.LightningModule):
         n_samples = self.n_obs['validation']
         
         validation_dataset = get_dataset(tokenizer=self.tokenizer, type_path="validation", num_samples=n_samples, args=self.hparams)
-        generator1 = torch.Generator().manual_seed(42)
-        validation_dataset = random_split(validation_dataset, [0.05, 0.95],generator1)[0]
-        sampler=RandomSampler(validation_dataset)
         return DataLoader(validation_dataset, batch_size=self.hparams.eval_batch_size, num_workers=4)
     
     
     def test_dataloader(self):
-        n_samples = self.n_obs['test']
-        test_dataset = get_dataset(tokenizer=self.tokenizer, type_path="test", num_samples=n_samples, args=self.hparams)
+        test_dataset = get_dataset(tokenizer=self.tokenizer, type_path="test", args=self.hparams)
         
         return DataLoader(test_dataset, batch_size=self.hparams.eval_batch_size, num_workers=0)
     
@@ -318,8 +329,7 @@ class T5FineTuner(pl.LightningModule):
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
 
-# logger = logging.getLogger(__name__)
-logger = logging.getLogger("lightning.pytorch")
+logger = logging.getLogger(__name__)
 
 class LoggingCallback(pl.Callback):
     def on_validation_end(self, trainer, pl_module):
@@ -346,23 +356,33 @@ class LoggingCallback(pl.Callback):
 prefix_path='' #Path to custom training data. Name the training corpus train_context.csv
 class Pretrain(Dataset):
     def __init__(self, tokenizer, type_path, num_samples, input_length, output_length, print_text=False):
-      self.dataset = self.split_into_segment(pd.read_csv(prefix_path+"train_context.csv"),input_length)
-      self.input_length = input_length
-      self.tokenizer = tokenizer
-      self.output_length = output_length
-      self.print_text = print_text
-  
+        fn = 'output.csv' if type_path == 'train' else 'output_eval.csv'
+        self.tokeniser = Tokeniser() # to break Chinese sentences
+        self.input_length = input_length
+        self.tokenizer = tokenizer
+        self.output_length = output_length
+        self.print_text = print_text
+        self.dataset = self.split_into_segment(pd.read_csv(prefix_path+fn),input_length)
+
+    def custom_tokenise(self, text):
+        # return text.split()
+        text = unicodedata.normalize("NFKC", text)
+        ret = self.tokeniser.tokenise(text)
+        if len(ret) < 3:
+            ret = list(text)
+        return ret
+    
     def split_into_segment(self, ds, input_length):
         new_rows = []
         for index, row in ds.iterrows():
-            if len(row['context'].split()) > input_length:
-                word_list = row['context'].split()
+            if len(self.custom_tokenise(row['context'])) > input_length:
+                word_list = self.custom_tokenise(row['context'])
                 seg1 = word_list[:input_length]
                 segment1, seg2_a = (' '.join(seg1)).rsplit('.',1)
                 segment2 = seg2_a + (' '.join(word_list[input_length:]))
-                ds.loc[index, 'context'] = segment1
-                while(len(segment2.split()) > input_length):
-                    word_list = segment2.split()
+                new_rows.append(segment1)
+                while(len(self.custom_tokenise(segment2)) > input_length):
+                    word_list = self.custom_tokenise(segment2)
                     seg1_ = word_list[:input_length]
                     if '.' in ' '.join(seg1_):
                         segment1_, seg2_a_ = (' '.join(seg1_)).rsplit('.',1)
@@ -372,8 +392,11 @@ class Pretrain(Dataset):
                         segment2 = (' '.join(word_list[input_length:]))
                     new_rows.append(segment1_)
                 new_rows.append(segment2)
-        ds2 = pd.DataFrame(new_rows, columns=['context'])
-        ds = pd.concat([ds, ds2])
+            elif len(self.custom_tokenise(row['context'])) < 3:
+                continue
+            else:
+                new_rows.append(row['context'])
+        ds = pd.DataFrame(new_rows, columns=['context'])
         return ds
 
     def __len__(self):
@@ -389,7 +412,7 @@ class Pretrain(Dataset):
         return text
 
     def span_corruption_mask(self, text, noise_span_length=3, noise_density=.15):
-        max_index = len(text.split())
+        max_index = len(self.custom_tokenise(text))
         mask = max_index * [0]
         span_num = math.ceil(( max_index * noise_density ) / 3 )
         exclude=[max_index-2, max_index-1]
@@ -418,7 +441,7 @@ class Pretrain(Dataset):
         return mask
     
     def noise_span_to_unique_sentinel(self, text, mask,sentinels):
-        tokens = text.split()
+        tokens = self.custom_tokenise(text)
         text_ = []
         one_count=0
         sentinel_cnt=0
@@ -433,11 +456,13 @@ class Pretrain(Dataset):
                         one_count=0
             else:
                 text_.append(tokens[i])
-        text_ = ' '.join(text_)
+        text_ = [t if is_cjk(t[0]) else ' '+t for t in text_]
+        text_ = ''.join(text_)
+        text_ = pangu.spacing_text(text_)
         return text_
 
     def nonnoise_span_to_unique_sentinel(self, text, mask,sentinels):
-        tokens = text.split()
+        tokens = self.custom_tokenise(text)
         text_ = []
         zero_first=True
         sentinel_cnt=0
@@ -450,7 +475,9 @@ class Pretrain(Dataset):
             else:
                 zero_first=True
                 text_.append(tokens[i])
-        text_ = ' '.join(text_)
+        text_ = [t if is_cjk(t[0]) else ' '+t for t in text_]
+        text_ = ''.join(text_)
+        text_ = pangu.spacing_text(text_)
         return text_
 
     def convert_to_features(self, example_batch):
@@ -485,8 +512,12 @@ class Pretrain(Dataset):
         return {"source_ids": source_ids, "source_mask": src_mask, "target_ids": target_ids, "target_mask": target_mask}
 
 def get_dataset(tokenizer, type_path, num_samples, args):
-    return Pretrain(tokenizer=tokenizer, type_path=type_path, num_samples=num_samples,  input_length=args.max_input_length, 
-                        output_length=args.max_output_length)
+    return Pretrain(
+        tokenizer=tokenizer, type_path=type_path, 
+        num_samples=num_samples, 
+        input_length=args.max_input_length, 
+        output_length=args.max_output_length
+    )
 
 if __name__ == '__main__':
     parser = ArgumentParser()
@@ -496,13 +527,13 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', default='t5_pretraining')
     parser.add_argument('--train_batch_size', default=8)
     parser.add_argument('--learning_rate', default=1e-3)
-    parser.add_argument('--model', default='t5-base')
+    parser.add_argument('--model', default='t5-small')
     hparam = parser.parse_args()
 
     args_dict = dict(
         output_dir="", # path to save the checkpoints
         model_name_or_path=hparam.model,
-        tokenizer_name_or_path=hparam.model,
+        tokenizer_name_or_path='./data/t5pretrain',
         max_input_length=int(hparam.input_length),
         max_output_length=int(hparam.output_length),
         freeze_encoder=False,
@@ -544,6 +575,7 @@ if __name__ == '__main__':
         gradient_clip_val=args.max_grad_norm,
         enable_checkpointing =True,
         val_check_interval=args.val_check_interval,
+        num_sanity_val_steps=0,
         callbacks=[LoggingCallback()]
     )
     
